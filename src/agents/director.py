@@ -12,8 +12,8 @@ class Director(BaseAgent):
         user_message = self._build_user_message(state)
         messages = self._create_messages(user_message)
 
-        # Tool call 처리 (Director는 1회만 tool call 허용)
-        response_text = self._handle_tool_calls(messages, max_iterations=2)
+        # Tool call 처리 (Director는 tool 검색 후 최종 응답까지 받아야 함)
+        response_text = self._handle_tool_calls(messages, max_iterations=4)
 
         # 응답 파싱
         if not response_text or (

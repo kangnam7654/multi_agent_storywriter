@@ -99,6 +99,21 @@ class BaseAgent(ABC):
                     response_text = str(content) if content else ""
                 break
 
+        # max_iterations 도달 후에도 응답이 없으면 마지막으로 한 번 더 시도
+        if not response_text.strip():
+            print(
+                f"⚠️ {self.__class__.__name__} max_iterations 도달, 최종 응답 요청 중..."
+            )
+            # tool 없이 일반 LLM으로 마지막 응답 요청
+            final_message = self.llm.invoke(messages)
+            if isinstance(final_message.content, str):
+                response_text = final_message.content
+            else:
+                response_text = (
+                    str(final_message.content) if final_message.content else ""
+                )
+            print(f"🔍 {self.__class__.__name__} 최종 응답: '{response_text[:100]}'...")
+
         return response_text
 
     def _extract_json(self, response: str) -> dict:
