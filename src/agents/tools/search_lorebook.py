@@ -8,6 +8,9 @@ from langchain_core.tools import tool
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# 전역 캐싱: Embedding 모델을 한 번만 로드
+_cached_retriever = None
+
 
 def pickle_dumps(obj: object) -> bytes:
     return pickle.dumps(obj)
@@ -22,7 +25,17 @@ def get_retriever(
     collection_name="split_parents",
     persist_directory="./chroma_db",
 ) -> ParentDocumentRetriever:
-    embedding_function = HuggingFaceEmbeddings(model_name=model)
+    global _cached_retriever
+
+    # 이미 로드된 retriever가 있으면 재사용
+    if _cached_retriever is not None:
+        return _cached_retriever
+
+    # CPU에서 실행하여 GPU 메모리 절약
+    embedding_function = HuggingFaceEmbeddings(
+        model_name=model,
+        model_kwargs={"device": "cpu"},
+    )
     vectorstore = Chroma(
         collection_name=collection_name,
         persist_directory=persist_directory,
@@ -37,13 +50,13 @@ def get_retriever(
     )
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
-    retriever = ParentDocumentRetriever(
+    _cached_retriever = ParentDocumentRetriever(
         vectorstore=vectorstore,
         docstore=store,
         child_splitter=child_splitter,
         parent_splitter=parent_splitter,
     )
-    return retriever
+    return _cached_retriever
 
 
 @tool

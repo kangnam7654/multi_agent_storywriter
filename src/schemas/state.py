@@ -47,9 +47,6 @@ class GraphState(BaseModel):
         default_factory=list, description="이전 스토리 버전 히스토리"
     )
 
-    chat_history: list = Field(
-        default_factory=list, description="대화형 에이전트의 채팅 히스토리"
-    )
     # Director 출력
     eval_report: EvalReport | None = Field(default=None, description="검수 결과 보고서")
     feedback_history: Annotated[list[str], add] = Field(

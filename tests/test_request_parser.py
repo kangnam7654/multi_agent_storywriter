@@ -1,11 +1,13 @@
+"""UserRequestParser 테스트"""
+
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
 
-from src.agents.request_parser import UserRequestParser
-from src.schemas.state import GraphState
+from src.agents.request_parser import RequestParserError, UserRequestParser
+from src.schemas.state import GraphState, RefinedRequest
 
 
 class TestUserRequestParser:
@@ -40,49 +42,6 @@ class TestUserRequestParser:
         assert "style" in parser.system_prompt
         assert "length" in parser.system_prompt
 
-    def test_call_raises_error_when_llm_is_none(self, sample_state):
-        """LLM이 None일 때 에러 발생 테스트"""
-        parser = UserRequestParser(llm=None)
-        parser.llm = None  # 명시적으로 None 설정
-
-        with pytest.raises(ValueError, match="LLM not set"):
-            parser(sample_state, runtime=None)
-
-    def test_call_invokes_chain_with_user_input(self, parser, mock_llm, sample_state):
-        """chain이 user_input으로 호출되는지 테스트"""
-        # Mock chain response
-        mock_response = AIMessage(
-            content=json.dumps(
-                {
-                    "summarized_prompt": "용사가 마왕을 물리치는 판타지 이야기",
-                    "genre": "판타지",
-                    "style": "소설",
-                    "length": "Medium",
-                }
-            )
-        )
-
-        # Mock the chain
-        with patch.object(parser, "llm") as patched_llm:
-            mock_chain = MagicMock()
-            mock_chain.invoke.return_value = mock_response
-            patched_llm.__or__ = MagicMock(return_value=mock_chain)
-
-            # __call__에서 prompt | llm 체인을 mock
-            with patch(
-                "src.agents.request_parser.ChatPromptTemplate"
-            ) as mock_prompt_template:
-                mock_prompt = MagicMock()
-                mock_prompt.__or__ = MagicMock(return_value=mock_chain)
-                mock_prompt_template.from_messages.return_value = mock_prompt
-
-                result = parser(sample_state, runtime=None)
-
-                # chain.invoke가 올바른 input으로 호출되었는지 확인
-                mock_chain.invoke.assert_called_once_with(
-                    {"input": sample_state.user_input}
-                )
-
     def test_system_prompt_contains_json_format_instructions(self, parser):
         """시스템 프롬프트에 JSON 형식 지침이 포함되어 있는지 테스트"""
         prompt = parser.system_prompt
@@ -112,31 +71,127 @@ class TestUserRequestParser:
         assert "}}" in prompt
 
 
-class TestUserRequestParserIntegration:
-    """UserRequestParser 통합 테스트 (실제 LLM 호출 없이)"""
+class TestUserRequestParserExtractJson:
+    """UserRequestParser JSON 추출 테스트"""
 
     @pytest.fixture
-    def mock_llm_with_response(self):
-        """응답을 반환하는 Mock LLM"""
-        mock_llm = MagicMock()
-        return mock_llm
+    def mock_llm(self):
+        return MagicMock()
 
-    def test_parse_fantasy_request(self, mock_llm_with_response):
-        """판타지 요청 파싱 테스트"""
-        parser = UserRequestParser(llm=mock_llm_with_response)
-        state = GraphState(user_input="드래곤과 마법사가 싸우는 이야기")
+    @pytest.fixture
+    def parser(self, mock_llm):
+        return UserRequestParser(llm=mock_llm)
 
-        # Mock response
+    def test_extract_json_direct(self, parser):
+        """직접 JSON 추출 테스트"""
+        content = '{"summarized_prompt": "테스트", "genre": "판타지"}'
+        result = parser._extract_json(content)
+
+        assert result["summarized_prompt"] == "테스트"
+        assert result["genre"] == "판타지"
+
+    def test_extract_json_with_code_block(self, parser):
+        """코드 블록 내 JSON 추출 테스트"""
+        content = """결과입니다:
+```json
+{"summarized_prompt": "테스트", "genre": "SF"}
+```"""
+        result = parser._extract_json(content)
+
+        assert result["summarized_prompt"] == "테스트"
+        assert result["genre"] == "SF"
+
+    def test_extract_json_with_surrounding_text(self, parser):
+        """텍스트로 둘러싸인 JSON 추출 테스트"""
+        content = '요청을 분석한 결과: {"summarized_prompt": "테스트"} 입니다.'
+        result = parser._extract_json(content)
+
+        assert result["summarized_prompt"] == "테스트"
+
+    def test_extract_json_empty_returns_none(self, parser):
+        """빈 내용에서 None 반환 테스트"""
+        assert parser._extract_json("") is None
+        assert parser._extract_json("   ") is None
+
+    def test_extract_json_invalid_returns_none(self, parser):
+        """잘못된 JSON에서 None 반환 테스트"""
+        assert parser._extract_json("not json") is None
+
+
+class TestUserRequestParserFallback:
+    """UserRequestParser 폴백 테스트"""
+
+    @pytest.fixture
+    def mock_llm(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def parser(self, mock_llm):
+        return UserRequestParser(llm=mock_llm)
+
+    def test_create_fallback_request(self, parser):
+        """폴백 요청 생성 테스트"""
+        user_input = "테스트 입력"
+        result = parser._create_fallback_request(user_input)
+
+        assert isinstance(result, RefinedRequest)
+        assert result.summarized_prompt == user_input
+        assert result.genre == "판타지"
+        assert result.style == "소설"
+        assert result.length == "Medium"
+
+    def test_create_refined_request(self, parser):
+        """RefinedRequest 생성 테스트"""
+        data = {
+            "summarized_prompt": "용사 이야기",
+            "genre": "판타지",
+            "style": "소설",
+            "length": "Short",
+        }
+        result = parser._create_refined_request(data)
+
+        assert result.summarized_prompt == "용사 이야기"
+        assert result.genre == "판타지"
+        assert result.length == "Short"
+
+    def test_create_refined_request_missing_key_raises(self, parser):
+        """필수 키가 없을 때 에러 테스트"""
+        data = {"genre": "판타지"}  # summarized_prompt 누락
+
+        with pytest.raises(KeyError):
+            parser._create_refined_request(data)
+
+    def test_create_refined_request_with_defaults(self, parser):
+        """기본값으로 RefinedRequest 생성 테스트"""
+        data = {"summarized_prompt": "테스트"}  # 다른 필드 누락
+        result = parser._create_refined_request(data)
+
+        assert result.summarized_prompt == "테스트"
+        assert result.genre == "판타지"  # 기본값
+        assert result.style == "소설"  # 기본값
+        assert result.length == "Medium"  # 기본값
+
+
+class TestUserRequestParserIntegration:
+    """UserRequestParser 통합 테스트"""
+
+    @pytest.fixture
+    def mock_llm(self):
+        return MagicMock()
+
+    def test_call_success(self, mock_llm):
+        """성공적인 호출 테스트"""
+        parser = UserRequestParser(llm=mock_llm)
+        state = GraphState(user_input="드래곤과 마법사 이야기")
+
         expected_response = {
-            "summarized_prompt": "드래곤과 마법사의 대결을 그린 판타지 이야기",
+            "summarized_prompt": "드래곤과 마법사의 대결 이야기",
             "genre": "판타지",
             "style": "소설",
             "length": "Medium",
         }
 
-        with patch(
-            "src.agents.request_parser.ChatPromptTemplate"
-        ) as mock_prompt_template:
+        with patch("src.agents.request_parser.ChatPromptTemplate") as mock_template:
             mock_chain = MagicMock()
             mock_chain.invoke.return_value = AIMessage(
                 content=json.dumps(expected_response)
@@ -144,66 +199,31 @@ class TestUserRequestParserIntegration:
 
             mock_prompt = MagicMock()
             mock_prompt.__or__ = MagicMock(return_value=mock_chain)
-            mock_prompt_template.from_messages.return_value = mock_prompt
+            mock_template.from_messages.return_value = mock_prompt
 
             result = parser(state, runtime=None)
 
-            assert result.content == json.dumps(expected_response)
+            assert result.request is not None
+            assert result.request.summarized_prompt == "드래곤과 마법사의 대결 이야기"
+            assert result.request.genre == "판타지"
 
-    def test_parse_scifi_request(self, mock_llm_with_response):
-        """SF 요청 파싱 테스트"""
-        parser = UserRequestParser(llm=mock_llm_with_response)
-        state = GraphState(user_input="우주에서 외계인과 만나는 SF 소설을 써줘")
+    def test_call_fallback_on_invalid_json(self, mock_llm):
+        """잘못된 JSON 시 폴백 테스트"""
+        parser = UserRequestParser(llm=mock_llm)
+        state = GraphState(user_input="테스트 입력")
 
-        expected_response = {
-            "summarized_prompt": "우주에서 외계인과의 첫 만남을 그린 SF 이야기",
-            "genre": "SF",
-            "style": "소설",
-            "length": "Medium",
-        }
-
-        with patch(
-            "src.agents.request_parser.ChatPromptTemplate"
-        ) as mock_prompt_template:
+        with patch("src.agents.request_parser.ChatPromptTemplate") as mock_template:
             mock_chain = MagicMock()
-            mock_chain.invoke.return_value = AIMessage(
-                content=json.dumps(expected_response)
-            )
+            # 항상 잘못된 응답 반환
+            mock_chain.invoke.return_value = AIMessage(content="잘못된 응답")
 
             mock_prompt = MagicMock()
             mock_prompt.__or__ = MagicMock(return_value=mock_chain)
-            mock_prompt_template.from_messages.return_value = mock_prompt
+            mock_template.from_messages.return_value = mock_prompt
 
             result = parser(state, runtime=None)
 
-            assert result.content == json.dumps(expected_response)
-
-    def test_parse_request_with_specific_length(self, mock_llm_with_response):
-        """길이가 지정된 요청 파싱 테스트"""
-        parser = UserRequestParser(llm=mock_llm_with_response)
-        state = GraphState(user_input="짧은 공포 이야기를 써줘")
-
-        expected_response = {
-            "summarized_prompt": "짧은 공포 이야기",
-            "genre": "공포",
-            "style": "소설",
-            "length": "Short",
-        }
-
-        with patch(
-            "src.agents.request_parser.ChatPromptTemplate"
-        ) as mock_prompt_template:
-            mock_chain = MagicMock()
-            mock_chain.invoke.return_value = AIMessage(
-                content=json.dumps(expected_response)
-            )
-
-            mock_prompt = MagicMock()
-            mock_prompt.__or__ = MagicMock(return_value=mock_chain)
-            mock_prompt_template.from_messages.return_value = mock_prompt
-
-            result = parser(state, runtime=None)
-
-            parsed = json.loads(result.content)
-            assert parsed["length"] == "Short"
-            assert parsed["genre"] == "공포"
+            # 폴백으로 원본 입력 사용
+            assert result.request is not None
+            assert result.request.summarized_prompt == "테스트 입력"
+            assert result.request.genre == "판타지"  # 기본값
