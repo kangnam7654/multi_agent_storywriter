@@ -5,6 +5,13 @@ from src.graph import create_graph
 from src.schemas.state import GraphState
 from src.utils.prompt_loader import load_system_prompts
 
+# 최종 결과 메시지: 승인 종료와 최대 검수 횟수 도달(미승인) 종료를 구분합니다.
+APPROVED_MESSAGE = "## 🎉 스토리 생성 완료 — Director 검수 승인\n"
+UNAPPROVED_MESSAGE_TEMPLATE = (
+    "## ⚠️ 최대 검수 횟수({max_reviews}회) 도달 — 미승인 상태로 종료\n\n"
+    "마지막 초안은 Director 승인을 받지 못했습니다. 위 피드백을 참고하세요.\n"
+)
+
 
 def generate_story(
     user_input: str,
@@ -37,6 +44,8 @@ def generate_story(
 
     # 출력 버퍼
     output_parts = []
+    # 노드는 변경분(델타)만 반환하므로 작성 시도 횟수는 여기서 직접 셉니다.
+    write_attempts = 0
 
     # 스트리밍 실행
     for event in app.stream(initial_state, stream_mode="updates"):
@@ -58,11 +67,11 @@ def generate_story(
                 # 스토리 작성 결과
                 if "story_output" in node_output and node_output["story_output"]:
                     story_out = node_output["story_output"]
-                    retry_count = node_output.get("retry_count", 0)
+                    write_attempts += 1
 
-                    if retry_count > 0:
+                    if write_attempts > 1:
                         output_parts.append(
-                            f"## ✍️ 스토리 수정 (시도 {retry_count + 1})\n\n"
+                            f"## ✍️ 스토리 수정 (시도 {write_attempts})\n\n"
                         )
                     else:
                         output_parts.append("## ✍️ 스토리 초안\n\n")
@@ -101,9 +110,17 @@ def generate_story(
                     output_parts.append("---\n\n")
                     yield "".join(output_parts)
 
-                # 완료 여부 확인
+                # 완료 여부 확인: 승인 종료와 미승인(최대 검수 횟수) 종료 구분
                 if node_output.get("is_complete"):
-                    output_parts.append("## 🎉 스토리 생성 완료!\n")
+                    report = node_output.get("eval_report")
+                    if report is not None and report.is_approved:
+                        output_parts.append(APPROVED_MESSAGE)
+                    else:
+                        output_parts.append(
+                            UNAPPROVED_MESSAGE_TEMPLATE.format(
+                                max_reviews=int(max_retries)
+                            )
+                        )
                     yield "".join(output_parts)
 
 
@@ -139,12 +156,15 @@ def create_demo():
                         info="사용할 Ollama 모델 이름",
                     )
                     max_retries = gr.Slider(
-                        label="최대 재시도 횟수",
+                        label="최대 검수 횟수",
                         minimum=1,
                         maximum=5,
                         value=3,
                         step=1,
-                        info="Director 피드백 반영 최대 횟수",
+                        info=(
+                            "작성+검수 라운드 최대 횟수 (첫 초안 포함). "
+                            "이 횟수 안에 승인되지 않으면 미승인 상태로 종료됩니다."
+                        ),
                     )
 
                 generate_btn = gr.Button("✨ 스토리 생성", variant="primary")

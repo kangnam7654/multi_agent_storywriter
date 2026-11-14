@@ -9,11 +9,19 @@ LangGraph를 사용하여 멀티 에이전트 스토리 생성 파이프라인�
     3. review: Director가 스토리 검수 및 피드백 제공
     4. 조건부 분기: 승인되면 종료, 아니면 write로 재시도
 
+노드 업데이트 계약:
+    `story_history`, `feedback_history`는 `operator.add` 리듀서를 사용하므로,
+    각 노드는 전체 상태가 아니라 "변경된 필드"와 "새로 추가된 히스토리 항목"만
+    반환합니다. 에이전트는 기존처럼 상태를 수정해 반환하지만, 그래프 노드가
+    에이전트에 사본을 넘기고 그 결과에서 델타만 추출합니다.
+
 Example:
     >>> from src.graph import run_story_generation
     >>> result = run_story_generation("용사가 드래곤을 물리치는 이야기")
     >>> print(result.story_output.story)
 """
+
+from typing import Any
 
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
@@ -22,6 +30,15 @@ from src.agents.director import Director
 from src.agents.request_parser import UserRequestParser
 from src.agents.story_writer import StoryWriter
 from src.schemas.state import GraphState
+
+
+def _appended(before: list[str], after: list[str]) -> list[str]:
+    """에이전트가 히스토리 끝에 새로 추가한 항목만 반환합니다.
+
+    `operator.add` 리듀서 필드에 전체 리스트를 다시 반환하면 기존 항목이
+    중복 누적되므로, 노드 입력 이후에 추가된 꼬리 부분만 델타로 사용합니다.
+    """
+    return list(after[len(before) :])
 
 
 def create_graph(
@@ -52,17 +69,32 @@ def create_graph(
     graph = StateGraph(GraphState)
 
     # ========== 노드 정의 ==========
-    def init_node(state: GraphState, runtime) -> GraphState:
+    # 에이전트는 받은 상태를 수정하여 전체 상태를 반환합니다. 리듀서 필드가
+    # 중복 누적되지 않도록 사본을 넘기고, 노드별로 필요한 델타만 반환합니다.
+    def init_node(state: GraphState, runtime) -> dict[str, Any]:
         """사용자 요청을 파싱하여 RefinedRequest로 변환"""
-        return request_parser(state, runtime)
+        result = request_parser(state.model_copy(deep=True), runtime)
+        return {"request": result.request}
 
-    def write_node(state: GraphState, runtime) -> GraphState:
+    def write_node(state: GraphState, runtime) -> dict[str, Any]:
         """StoryWriter가 스토리를 작성하고 StoryOutput 생성"""
-        return story_writer(state, runtime)
+        result = story_writer(state.model_copy(deep=True), runtime)
+        return {
+            "story_output": result.story_output,
+            "story_history": _appended(state.story_history, result.story_history),
+        }
 
-    def review_node(state: GraphState, runtime) -> GraphState:
+    def review_node(state: GraphState, runtime) -> dict[str, Any]:
         """Director가 스토리를 검수하고 EvalReport 생성"""
-        return director(state, runtime)
+        result = director(state.model_copy(deep=True), runtime)
+        return {
+            "eval_report": result.eval_report,
+            "feedback_history": _appended(
+                state.feedback_history, result.feedback_history
+            ),
+            "retry_count": result.retry_count,
+            "is_complete": result.is_complete,
+        }
 
     # 노드 추가
     graph.add_node("init", init_node)
@@ -172,13 +204,22 @@ def run_story_generation_stream(
     print("🚀 스토리 생성 시작")
     print("=" * 50)
 
+    review_result = None
     for event in app.stream(initial_state, stream_mode="updates"):
         for node_name, node_output in event.items():
             print(f"\n📍 노드: {node_name}")
             print("-" * 30)
+            if node_name == "review":
+                review_result = node_output.get("eval_report")
 
     print("\n" + "=" * 50)
-    print("✨ 스토리 생성 완료")
+    if review_result is not None:
+        if review_result.is_approved:
+            print("스토리 생성 흐름 종료 — Director 승인")
+        else:
+            print("스토리 생성 흐름 종료 — 미승인")
+    else:
+        print("스토리 생성 흐름 종료 — 검수 결과 없음")
     print("=" * 50)
 
 
@@ -245,9 +286,5 @@ async def run_story_generation_stream_tokens(
                 print(f"\n📍 노드 종료: {event['name']}")
 
     print("\n" + "=" * 50)
-    print("✨ 스토리 생성 완료")
-    print("=" * 50)
-
-    print("\n" + "=" * 50)
-    print("✨ 스토리 생성 완료")
+    print("스토리 생성 흐름 종료")
     print("=" * 50)
